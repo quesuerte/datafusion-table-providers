@@ -1,7 +1,7 @@
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::opendal::OpenDALDataSource;
 use std::sync::Arc;
-use opendal::services::Fs;
+use opendal::services::FsConfig;
 
 /// This example demonstrates how to:
 /// 1. Create a PostgreSQL connection pool
@@ -28,7 +28,10 @@ use opendal::services::Fs;
 /// ```
 #[tokio::main]
 async fn main() {
-    let table_factory = OpenDALDataSource::new(Fs::default().root("/")).unwrap();
+    let mut cfg = FsConfig::default();
+    cfg.root = Some("/".to_string());
+    let table_factory = OpenDALDataSource::new(cfg).unwrap();
+    //let table_factory = OpenDALDataSource::new(Fs::default().root("/")).unwrap();
 
     // Create DataFusion session context
     let ctx = SessionContext::new();

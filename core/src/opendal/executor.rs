@@ -12,7 +12,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::array::StringArray;
 use opendal::Operator;
 use opendal::blocking::Operator as Blop;
-use opendal::Builder;
+use opendal::Configurator;
 use r2d2::ManageConnection;
 use r2d2::Pool;
 use std::fmt::Debug;
@@ -59,11 +59,11 @@ impl Display for OpenDALExecError {
 }
 
 #[derive(Clone, Debug)]
-struct OpenDALManager<T: Builder + Send + Sync + 'static + Debug> {
+struct OpenDALManager<T: Configurator + Clone + Send + Sync + 'static + Debug> {
     builder: T,
 }
 
-impl<T: Builder + Send + Sync + 'static + Debug> OpenDALManager<T> {
+impl<T: Configurator + Clone + Send + Sync + 'static + Debug> OpenDALManager<T> {
     fn new(bldr: T) -> Self {
         Self { builder: bldr }
     }
@@ -72,13 +72,13 @@ impl<T: Builder + Send + Sync + 'static + Debug> OpenDALManager<T> {
 /// Implement r2d2::ManageConnection properly
 impl<T> ManageConnection for OpenDALManager<T>
 where
-    T: Builder + Send + Sync + 'static + Debug,
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     type Connection = Blop;
     type Error = OpenDALExecError;
     fn connect(&self) -> Result<Self::Connection, OpenDALExecError> {
         let builder = self.builder.clone();
-        Ok(Blop::new(Operator::new(builder)?.finish())?)
+        Ok(Blop::new(Operator::from_config(builder)?.finish())?)
     }
     fn is_valid(&self, conn: &mut Self::Connection) -> Result<(),OpenDALExecError> {
         Ok(conn.check()?)
@@ -92,14 +92,14 @@ where
 #[derive(Clone, Debug)]
 pub struct OpenDALDataSource<T>
 where
-    T: Builder + Send + Sync + 'static + Debug,
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     pool: Pool<OpenDALManager<T>>,
 }
 
 impl<T> OpenDALDataSource<T>
 where
-    T: Builder + Send + Sync + 'static + Debug,
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     pub fn new(bldr: T) -> Result<Self,OpenDALExecError> {
         let manager = OpenDALManager::new(bldr);
@@ -115,7 +115,7 @@ where
 #[derive(Debug)]
 pub struct OpenDALExec<T>
 where
-    T: Builder + Send + Sync + 'static + Debug,
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     pub db: OpenDALDataSource<T>,
     pub projected_schema: SchemaRef,
@@ -123,7 +123,7 @@ where
 
 impl<T> DisplayAs for OpenDALExec<T>
 where
-    T: Builder + Send + Sync + 'static + Debug,
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "OpenDALExec")
@@ -132,7 +132,7 @@ where
 
 impl<T> ExecutionPlan for OpenDALExec<T>
 where
-    T: Builder + Send + Sync + 'static + Debug,
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     fn name(&self) -> &str {
         "OpenDALExec"

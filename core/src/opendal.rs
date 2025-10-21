@@ -8,7 +8,7 @@ use std::any::Any;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use datafusion::error::DataFusionError;
-use opendal::Builder;
+use opendal::Configurator;
 use std::fmt::Debug;
 
 mod executor;
@@ -17,7 +17,7 @@ pub use crate::opendal::executor::OpenDALDataSource;
 
 impl<T> OpenDALExec<T>
 where
-    T: Builder + Clone + Send + Sync + 'static + Debug,
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     fn new(projections: Option<&Vec<usize>>, schema: SchemaRef, db: OpenDALDataSource<T>) -> Self {
         let projected_schema = project_schema(&schema, projections).unwrap();
@@ -30,7 +30,7 @@ where
 
 impl<T> OpenDALDataSource<T>
 where
-    T: Builder + Clone + Send + Sync + 'static + Debug,
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     pub(crate) async fn create_physical_plan(
         &self,
@@ -46,7 +46,7 @@ where
 #[async_trait]
 impl<T> TableProvider for OpenDALDataSource<T>
 where
-    T: Builder + Clone + Send + Sync + 'static + Debug,
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     fn as_any(&self) -> &dyn Any {
         self
