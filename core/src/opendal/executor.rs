@@ -1,79 +1,141 @@
 use std::any::Any;
-use std::sync::{Arc, Mutex};
-use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use datafusion::common::Result;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::physical_plan::expressions::PhysicalSortExpr;
 use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream, DisplayAs, DisplayFormatType,
-    Statistics, PlanProperties
+    PlanProperties
 };
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::context::TaskContext;
-use datafusion::arrow::array::{UInt64Builder, UInt8Builder};
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::arrow::record_batch::RecordBatch;
-use opendal::services::Fs;
+use datafusion::arrow::array::StringArray;
 use opendal::Operator;
-use opendal::blocking::Operator;
-use opendal::Result;
-use opendal::ErrorKind;
+use opendal::blocking::Operator as Blop;
+use opendal::Builder;
 use r2d2::ManageConnection;
 use r2d2::Pool;
+use std::fmt::Debug;
+use datafusion::error::DataFusionError;
+use opendal::Error as opendalErr;
+use r2d2::Error as r2d2Err;
+use std::error::Error;
+use std::fmt::Display;
+use std::fmt;
 
-struct OpenDALManager {
-    builder: opendal::Builder
+#[derive(Debug)]
+pub enum OpenDALExecError {
+    OpenDALErr(String),
+    R2D2Err(String),
 }
-impl ManageConnection for OpenDALManager {
-    fn connect(&self) -> Result<blocking::Operator, ErrorKind> {
-        let mut builder = self.builder.clone();
-        Ok(Operator::new(builder)?.finish())
+
+impl From<r2d2Err> for OpenDALExecError {
+    fn from(err: r2d2Err) -> Self {
+        Self::R2D2Err(format!("{:?}",err))
     }
-    fn is_valid(&self, op: blocking::Operator) -> Result<(),ErrorKind> {
-        op.check()?
+}
+
+impl From<opendalErr> for OpenDALExecError {
+    fn from(err: opendalErr) -> Self {
+        Self::OpenDALErr(format!("{:?}",err))
     }
-    fn has_broken(&self, op: blocking::Operator) -> bool {
-        match op.check() {
-            Ok(_) => false,
-            Err(_) => true,
+}
+
+impl Into<DataFusionError> for OpenDALExecError {
+    fn into(self) -> DataFusionError {
+        DataFusionError::Execution(format!("{:?}",self))
+    }
+}
+
+impl Error for OpenDALExecError {}
+
+impl Display for OpenDALExecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenDALExecError::OpenDALErr(inner) => write!(f, "{}", inner),
+            OpenDALExecError::R2D2Err(inner) => write!(f,"{}", inner)
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OpenDALManager<T: Builder + Send + Sync + 'static + Debug> {
+    builder: T,
+}
+
+impl<T: Builder + Send + Sync + 'static + Debug> OpenDALManager<T> {
+    fn new(bldr: T) -> Self {
+        Self { builder: bldr }
+    }
+}
+
+/// Implement r2d2::ManageConnection properly
+impl<T> ManageConnection for OpenDALManager<T>
+where
+    T: Builder + Send + Sync + 'static + Debug,
+{
+    type Connection = Blop;
+    type Error = OpenDALExecError;
+    fn connect(&self) -> Result<Self::Connection, OpenDALExecError> {
+        let builder = self.builder.clone();
+        Ok(Blop::new(Operator::new(builder)?.finish())?)
+    }
+    fn is_valid(&self, conn: &mut Self::Connection) -> Result<(),OpenDALExecError> {
+        Ok(conn.check()?)
+    }
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        conn.check().is_err()
     }
 }
 
 /// A custom datasource, used to represent a datastore with a single index
 #[derive(Clone, Debug)]
-pub struct OpenDALDataSource {
-    pool: Pool,
+pub struct OpenDALDataSource<T>
+where
+    T: Builder + Send + Sync + 'static + Debug,
+{
+    pool: Pool<OpenDALManager<T>>,
 }
 
-impl OpenDALDataSource {
-    fn new() -> Result<Self,BuildError> {
-        let manager = OpenDALManager{
-            builder: Fs::default().root("/")
-        };
+impl<T> OpenDALDataSource<T>
+where
+    T: Builder + Send + Sync + 'static + Debug,
+{
+    pub fn new(bldr: T) -> Result<Self,OpenDALExecError> {
+        let manager = OpenDALManager::new(bldr);
         let pool = Pool::builder()
             .max_size(15)
             .build(manager)?;
-        return Self {
+        Ok(Self {
             pool: pool
-        }
+           })
     }
 }
 
 #[derive(Debug)]
-struct CustomExec {
-    db: OpenDALDataSource,
-    projected_schema: SchemaRef,
+pub struct OpenDALExec<T>
+where
+    T: Builder + Send + Sync + 'static + Debug,
+{
+    pub db: OpenDALDataSource<T>,
+    pub projected_schema: SchemaRef,
 }
 
-impl DisplayAs for CustomExec {
+impl<T> DisplayAs for OpenDALExec<T>
+where
+    T: Builder + Send + Sync + 'static + Debug,
+{
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "CustomExec")
+        write!(f, "OpenDALExec")
     }
 }
 
-impl ExecutionPlan for CustomExec {
+impl<T> ExecutionPlan for OpenDALExec<T>
+where
+    T: Builder + Send + Sync + 'static + Debug,
+{
     fn name(&self) -> &str {
-        "CustomExec"
+        "OpenDALExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -105,12 +167,12 @@ impl ExecutionPlan for CustomExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let op = self.pool.get()?;
+        let op = self.db.pool.get().map_err(|e: r2d2::Error| <OpenDALExecError as Into<DataFusionError>>::into(OpenDALExecError::from(e)))?;
         Ok(Box::pin(MemoryStream::try_new(
             vec![RecordBatch::try_new(
                 self.projected_schema.clone(),
                 vec![
-                    Arc::new(op.list(".")?.into_iter().map(|entry| entry.name()).collect()),
+                    Arc::new(StringArray::from(op.list(".").map_err(|e: opendal::Error| <OpenDALExecError as Into<DataFusionError>>::into(OpenDALExecError::from(e)))?.into_iter().map(|entry| entry.name().to_owned()).collect::<Vec<String>>())),
                 ],
             )?],
             self.schema(),

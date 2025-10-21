@@ -2,10 +2,24 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::logical_expr::expr::Expr;
-use datafusion::physical_plan::project_schema;
+use datafusion::physical_plan::{project_schema,ExecutionPlan};
+use std::sync::Arc;
+use std::any::Any;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
-impl CustomExec {
-    fn new(projections: Option<&Vec<usize>>, schema: SchemaRef, db: CustomDataSource) -> Self {
+use datafusion::error::DataFusionError;
+use opendal::Builder;
+use std::fmt::Debug;
+
+mod executor;
+use crate::opendal::executor::OpenDALExec;
+pub use crate::opendal::executor::OpenDALDataSource;
+
+impl<T> OpenDALExec<T>
+where
+    T: Builder + Clone + Send + Sync + 'static + Debug,
+{
+    fn new(projections: Option<&Vec<usize>>, schema: SchemaRef, db: OpenDALDataSource<T>) -> Self {
         let projected_schema = project_schema(&schema, projections).unwrap();
         Self {
             db,
@@ -14,18 +28,26 @@ impl CustomExec {
     }
 }
 
-impl CustomDataSource {
+impl<T> OpenDALDataSource<T>
+where
+    T: Builder + Clone + Send + Sync + 'static + Debug,
+{
     pub(crate) async fn create_physical_plan(
         &self,
         projections: Option<&Vec<usize>>,
         schema: SchemaRef,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(CustomExec::new(projections, schema, self.clone())))
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>,DataFusionError> {
+        Ok(Arc::new(OpenDALExec::new(projections, schema, self.clone())))
     }
 }
 
 #[async_trait]
-impl TableProvider for CustomDataSource {
+impl<T> TableProvider for OpenDALDataSource<T>
+where
+    T: Builder + Clone + Send + Sync + 'static + Debug,
+{
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -47,7 +69,7 @@ impl TableProvider for CustomDataSource {
         // filters and limit can be used here to inject some push-down operations if needed
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    ) -> Result<Arc<dyn ExecutionPlan>,DataFusionError> {
         return self
             .create_physical_plan(projection, self.schema(), filters, limit)
             .await;
