@@ -51,7 +51,7 @@ async fn main() {
         .await
         .expect("select failed");
     match df.show().await {
-        Ok(val) => (),
+        Ok(_val) => (),
         Err(err) => println!("Failed to retreive results: {}",err)
     };
 }

@@ -15,18 +15,6 @@ mod executor;
 use crate::opendal::executor::OpenDALExec;
 pub use crate::opendal::executor::OpenDALDataSource;
 
-impl<T> OpenDALExec<T>
-where
-    T: Configurator + Clone + Send + Sync + 'static + Debug,
-{
-    fn new(projections: Option<&Vec<usize>>, schema: SchemaRef, db: OpenDALDataSource<T>) -> Self {
-        let projected_schema = project_schema(&schema, projections).unwrap();
-        Self {
-            db,
-            projected_schema,
-        }
-    }
-}
 
 impl<T> OpenDALDataSource<T>
 where
@@ -36,8 +24,8 @@ where
         &self,
         projections: Option<&Vec<usize>>,
         schema: SchemaRef,
-        filters: &[Expr],
-        limit: Option<usize>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>,DataFusionError> {
         Ok(Arc::new(OpenDALExec::new(projections, schema, self.clone())))
     }
