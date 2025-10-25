@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arrow::error::ArrowError;
 use datafusion::common::Result;
 use datafusion::physical_plan::{
+    project_schema,
     ExecutionPlan, SendableRecordBatchStream, DisplayAs, DisplayFormatType,
     PlanProperties
 };
@@ -139,9 +140,9 @@ impl<T> OpenDALExec<T>
 where
     T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
-    fn new(projections: Option<&Vec<usize>>, schema: SchemaRef, db: OpenDALDataSource<T>) -> Self {
-        let projected_schema = project_schema(&schema, projections).unwrap();
-        Self {
+    pub fn build(projections: Option<&Vec<usize>>, schema: SchemaRef, db: OpenDALDataSource<T>) -> Result<Self,DataFusionError> {
+        let projected_schema = project_schema(&schema, projections)?;
+        Ok(Self {
             db,
             projected_schema: projected_schema.clone(),
             properties: PlanProperties::new(
@@ -150,7 +151,7 @@ where
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
-        }
+        })
     }
 }
 

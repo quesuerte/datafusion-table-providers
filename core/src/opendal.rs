@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::logical_expr::expr::Expr;
-use datafusion::physical_plan::{project_schema,ExecutionPlan};
+use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 use std::any::Any;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -27,7 +27,7 @@ where
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>,DataFusionError> {
-        Ok(Arc::new(OpenDALExec::new(projections, schema, self.clone())))
+        Ok(Arc::new(OpenDALExec::build(projections, schema, self.clone())?))
     }
 }
 
