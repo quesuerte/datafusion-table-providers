@@ -1,23 +1,24 @@
 use std::any::Any;
 use std::sync::Arc;
-use arrow::error::ArrowError;
 use datafusion::common::Result;
+use arrow::error::ArrowError;
 use datafusion::physical_plan::{
     project_schema,
     ExecutionPlan, SendableRecordBatchStream, DisplayAs, DisplayFormatType,
     PlanProperties
 };
+use futures::TryStreamExt;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::execution_plan::{EmissionType,Boundedness};
-
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::array::StringArray;
+use datafusion::arrow::array::{Array,LargeBinaryArray,StringArray,BooleanArray,UInt64Array};
 use opendal::Operator;
 use opendal::Configurator;
+use opendal::EntryMode;
 use deadpool::managed;
 use deadpool::managed::BuildError;
 use std::fmt::Debug;
@@ -111,17 +112,19 @@ where
     T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     pool: managed::Pool<OpenDALManager<T>>,
+    target: String,
 }
 
 impl<T> OpenDALDataSource<T>
 where
     T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
-    pub fn new(bldr: T) -> Result<Self,OpenDALExecError> {
+    pub fn new(bldr: T, target: String) -> Result<Self,OpenDALExecError> {
         let manager = OpenDALManager::new(bldr);
         let pool = managed::Pool::builder(manager).build()?;
         Ok(Self {
-            pool: pool
+            pool,
+            target,
            })
     }
 }
@@ -134,13 +137,15 @@ where
     pub db: OpenDALDataSource<T>,
     pub projected_schema: SchemaRef,
     pub properties: PlanProperties,
+    limit: Option<usize>,
+
 }
 
 impl<T> OpenDALExec<T>
 where
     T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
-    pub fn build(projections: Option<&Vec<usize>>, schema: SchemaRef, db: OpenDALDataSource<T>) -> Result<Self,DataFusionError> {
+    pub fn build(projections: Option<&Vec<usize>>, schema: SchemaRef, db: OpenDALDataSource<T>, limit: Option<usize>) -> Result<Self,DataFusionError> {
         let projected_schema = project_schema(&schema, projections)?;
         Ok(Self {
             db,
@@ -151,6 +156,7 @@ where
                 EmissionType::Incremental,
                 Boundedness::Bounded,
             ),
+            limit,
         })
     }
 }
@@ -205,8 +211,10 @@ where
         let tx = builder.tx();
         let pool = self.db.pool.clone();
         let schema = self.schema();
+        let target = self.db.target.clone();
+        let limit = self.limit.clone();
         builder.spawn(async move {
-            let batch = get_opendal_record_batch(schema,pool).await?;
+            let batch = get_opendal_record_batch(target,schema,pool,limit).await?;
             tx.send(Ok(batch)).await.unwrap();
             Ok(())
         });
@@ -214,19 +222,76 @@ where
     }
 }
 
-async fn get_opendal_record_batch<T>(schema: SchemaRef, pool: managed::Pool<OpenDALManager<T>>) -> Result<RecordBatch> 
+async fn get_opendal_record_batch<T>(target: String, schema: SchemaRef, pool: managed::Pool<OpenDALManager<T>>, limit: Option<usize>) -> Result<RecordBatch> 
 where
     T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     let op = pool.get().await.map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))?;
-    let array = Arc::new(StringArray::from_iter_values(
-        op.list(".").await
-            .map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))?
-            .into_iter()
-            .map(|entry| entry.name().to_owned()),
-    ));
     RecordBatch::try_new(
-        schema,
-        vec![array],
+        schema.clone(),
+        file_lister(target, schema, &op, limit).await.map_err(|e| Into::<DataFusionError>::into(e))?,
     ).map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))
+}
+
+async fn file_lister(target: String, schema: SchemaRef, op: &Operator, limit: Option<usize>) -> Result<Vec<Arc<dyn Array>>,OpenDALExecError> {
+    let mut rtn = Vec::new();
+    let mut lister = {
+        let mut builder = op.lister_with(&target);
+        if let Some(l) = limit {
+            builder = builder.limit(l);
+        }
+        builder.await?
+    };
+    let mut name_array: Option<Vec<String>> = schema.fields.find("name").map(|_| Vec::new());
+    let mut blob_array: Option<Vec<Option<Vec<u8>>>> = schema.fields.find("blob").map(|_| Vec::new());
+    let mut file_array: Option<Vec<bool>> = schema.fields.find("is_file").map(|_| Vec::new());
+    let mut size_array: Option<Vec<u64>> = schema.fields.find("size").map(|_| Vec::new());
+    let mut content_array: Option<Vec<Option<String>>> = schema.fields.find("content_type").map(|_| Vec::new());
+
+    while let Some(entry) = lister.try_next().await? {
+        if entry.metadata().mode() == EntryMode::Unknown {
+            continue
+        }
+        if let Some(ref mut vec) = name_array {
+            vec.push(entry.name().to_string());
+        }
+        let (path, meta) = entry.into_parts();
+        if let Some(ref mut vec) = blob_array {
+            if !meta.is_file() {
+                vec.push(None);
+            } else {
+                vec.push(Some(op.read(&path).await?.to_vec()));
+            }
+        }
+        if let Some(ref mut vec) = file_array {
+            vec.push(meta.is_file());
+        }
+        if size_array.is_some() || content_array.is_some() {
+            // Looks like these properties aren't loaded unless we call stat
+            let meta2 = op.stat(&path).await?;
+            if let Some(ref mut vec) = size_array {
+                vec.push(meta2.content_length());
+            }
+            if let Some(ref mut vec) = content_array {
+                vec.push(meta2.content_type().map(str::to_string));
+            }
+        }
+    }
+    if let Some(vec) = name_array {
+        rtn.push(Arc::new(StringArray::from(vec)) as Arc<dyn Array>);
+    }
+    if let Some(vec) = blob_array {
+        let v_refs: Vec<Option<&[u8]>> = vec.iter().map(|b| b.as_deref()).collect();
+        rtn.push(Arc::new(LargeBinaryArray::from_opt_vec(v_refs)) as Arc<dyn Array>);
+    }
+    if let Some(vec) = file_array {
+        rtn.push(Arc::new(BooleanArray::from(vec)) as Arc<dyn Array>);
+    }
+    if let Some(vec) = size_array {
+        rtn.push(Arc::new(UInt64Array::from(vec)) as Arc<dyn Array>);
+    }
+    if let Some(vec) = content_array {
+        rtn.push(Arc::new(StringArray::from(vec)) as Arc<dyn Array>);
+    }
+    Ok(rtn)
 }

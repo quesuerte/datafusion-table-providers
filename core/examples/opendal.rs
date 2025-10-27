@@ -30,7 +30,7 @@ use opendal::services::FsConfig;
 async fn main() {
     let mut cfg = FsConfig::default();
     cfg.root = Some("/".to_string());
-    let table_factory = OpenDALDataSource::new(cfg).unwrap();
+    let table_factory = OpenDALDataSource::new(cfg,"/home/blinn/Downloads/".to_string()).unwrap();
     //let table_factory = OpenDALDataSource::new(Fs::default().root("/")).unwrap();
 
     // Create DataFusion session context
@@ -47,7 +47,7 @@ async fn main() {
 
     // Query Example 1: Query the renamed table through default catalog
     let df = ctx
-        .sql("SELECT name FROM datafusion.public.root_files")
+        .sql("SELECT name, is_file, size, content_type FROM datafusion.public.root_files")
         .await
         .expect("select failed");
     match df.show().await {

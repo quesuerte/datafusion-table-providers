@@ -25,9 +25,9 @@ where
         projections: Option<&Vec<usize>>,
         schema: SchemaRef,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>,DataFusionError> {
-        Ok(Arc::new(OpenDALExec::build(projections, schema, self.clone())?))
+        Ok(Arc::new(OpenDALExec::build(projections, schema, self.clone(),limit)?))
     }
 }
 
@@ -43,6 +43,11 @@ where
     fn schema(&self) -> SchemaRef {
         SchemaRef::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),
+            Field::new("blob", DataType::LargeBinary, true),
+            Field::new("is_file", DataType::Boolean, false),
+            Field::new("size", DataType::UInt64, false),
+            Field::new("content_type", DataType::Utf8, true),
+//            Field::new("last_modified", DataType::Timestamp, true),
         ]))
     }
 
