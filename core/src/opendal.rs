@@ -5,7 +5,7 @@ use datafusion::logical_expr::expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 use std::any::Any;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 use datafusion::error::DataFusionError;
 use opendal::Configurator;
@@ -47,7 +47,7 @@ where
             Field::new("is_file", DataType::Boolean, false),
             Field::new("size", DataType::UInt64, false),
             Field::new("content_type", DataType::Utf8, true),
-//            Field::new("last_modified", DataType::Timestamp, true),
+            Field::new("last_modified", DataType::Timestamp(TimeUnit::Nanosecond,None), true),
         ]))
     }
 

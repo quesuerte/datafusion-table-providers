@@ -47,7 +47,7 @@ async fn main() {
 
     // Query Example 1: Query the renamed table through default catalog
     let df = ctx
-        .sql("SELECT name, is_file, size, content_type FROM datafusion.public.root_files")
+        .sql("SELECT name, is_file, size, content_type, last_modified AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' FROM datafusion.public.root_files")
         .await
         .expect("select failed");
     match df.show().await {

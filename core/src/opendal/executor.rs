@@ -15,7 +15,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::array::{Array,LargeBinaryArray,StringArray,BooleanArray,UInt64Array};
+use datafusion::arrow::array::{Array,LargeBinaryArray,StringArray,BooleanArray,UInt64Array,TimestampNanosecondArray};
 use opendal::Operator;
 use opendal::Configurator;
 use opendal::EntryMode;
@@ -247,6 +247,7 @@ async fn file_lister(target: String, schema: SchemaRef, op: &Operator, limit: Op
     let mut file_array: Option<Vec<bool>> = schema.fields.find("is_file").map(|_| Vec::new());
     let mut size_array: Option<Vec<u64>> = schema.fields.find("size").map(|_| Vec::new());
     let mut content_array: Option<Vec<Option<String>>> = schema.fields.find("content_type").map(|_| Vec::new());
+    let mut last_modified_array: Option<Vec<Option<i64>>> = schema.fields.find("last_modified").map(|_| Vec::new());
 
     while let Some(entry) = lister.try_next().await? {
         if entry.metadata().mode() == EntryMode::Unknown {
@@ -266,7 +267,7 @@ async fn file_lister(target: String, schema: SchemaRef, op: &Operator, limit: Op
         if let Some(ref mut vec) = file_array {
             vec.push(meta.is_file());
         }
-        if size_array.is_some() || content_array.is_some() {
+        if size_array.is_some() || content_array.is_some() || last_modified_array.is_some() {
             // Looks like these properties aren't loaded unless we call stat
             let meta2 = op.stat(&path).await?;
             if let Some(ref mut vec) = size_array {
@@ -274,6 +275,9 @@ async fn file_lister(target: String, schema: SchemaRef, op: &Operator, limit: Op
             }
             if let Some(ref mut vec) = content_array {
                 vec.push(meta2.content_type().map(str::to_string));
+            }
+            if let Some(ref mut vec) = last_modified_array {
+                vec.push(meta2.last_modified().and_then(|t| t.timestamp_nanos_opt()));
             }
         }
     }
@@ -292,6 +296,9 @@ async fn file_lister(target: String, schema: SchemaRef, op: &Operator, limit: Op
     }
     if let Some(vec) = content_array {
         rtn.push(Arc::new(StringArray::from(vec)) as Arc<dyn Array>);
+    }
+    if let Some(vec) = last_modified_array {
+        rtn.push(Arc::new(TimestampNanosecondArray::from(vec)) as Arc<dyn Array>);
     }
     Ok(rtn)
 }
