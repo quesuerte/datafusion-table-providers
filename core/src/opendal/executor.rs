@@ -271,7 +271,15 @@ where
         let pool = self.db.inner.pool.clone();
         let target = self.db.inner.target.clone();
         let limit = self.limit.clone();
-        let p_sch = Arc::clone(&self.projected_schema);
+        // If there is an aggregate or something that doesn't project any columns, project primary
+        // key
+        let p_sch = if self.projected_schema.fields().len() == 0 {
+            SchemaRef::new(Schema::new(vec![
+                Field::new(PATH_COL, DataType::Utf8, false),
+            ]))
+        } else {
+            Arc::clone(&self.projected_schema)
+        };
 
         builder.spawn(async move {
             let op = pool
@@ -430,11 +438,6 @@ fn build_batch(
     }
     if schema.fields.find(LAST_MODIFIED_COL).is_some() {
         columns.push(Arc::new(TimestampNanosecondArray::from(last_modified.to_vec())));
-    }
-    if columns.is_empty() {
-        // DataFusion expects at least one column per batch.
-        let dummy: Vec<bool> = std::iter::repeat(true).take(paths.len().max(1)).collect();
-        columns.push(Arc::new(BooleanArray::from(dummy)) as Arc<dyn Array>);
     }
 
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
