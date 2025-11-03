@@ -34,6 +34,22 @@ use async_trait::async_trait;
 use datafusion::physical_plan::metrics::MetricsSet;
 use crate::util::retriable_error::check_and_mark_retriable_error;
 
+// Field names
+static PATH_COL: &str = "path";
+static NAME_COL: &str = "name";
+static BLOB_COL: &str = "blob";
+static IS_FILE_COL: &str = "is_file";
+static SIZE_COL: &str = "size";
+static CONTENT_TYPE_COL: &str = "content_type";
+static LAST_MODIFIED_COL: &str = "last_modified";
+
+// At this point, these determine global batch sizes for read operations
+// New batches will start either every 1000 rows, or every 10 MB of blob file if they're projected,
+// whichever comes first
+static BATCH_SIZE_THRESHOLD: u64 = 100 * 1024 * 1024; // e.g., 10 MB
+static ROW_COUNT_THRESHOLD: usize = 1000;
+
+
 #[derive(Debug)]
 pub enum OpenDALExecError {
     OpenDALErr(String),
@@ -135,13 +151,13 @@ where
         let manager = OpenDALManager::new(bldr);
         let pool = managed::Pool::builder(manager).build()?;
         let schema = SchemaRef::new(Schema::new(vec![
-            Field::new("path", DataType::Utf8, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("blob", DataType::LargeBinary, true),
-            Field::new("is_file", DataType::Boolean, true),
-            Field::new("size", DataType::UInt64, true),
-            Field::new("content_type", DataType::Utf8, true),
-            Field::new("last_modified", DataType::Timestamp(TimeUnit::Nanosecond,None), true),
+            Field::new(PATH_COL, DataType::Utf8, false),
+            Field::new(NAME_COL, DataType::Utf8, true),
+            Field::new(BLOB_COL, DataType::LargeBinary, true),
+            Field::new(IS_FILE_COL, DataType::Boolean, true),
+            Field::new(SIZE_COL, DataType::UInt64, true),
+            Field::new(CONTENT_TYPE_COL, DataType::Utf8, true),
+            Field::new(LAST_MODIFIED_COL, DataType::Timestamp(TimeUnit::Nanosecond,None), true),
         ]));
         Ok(Self {
             pool,
@@ -247,107 +263,181 @@ where
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let mut builder = RecordBatchReceiverStreamBuilder::new(Arc::clone(&self.projected_schema), 10);
+        let mut builder = RecordBatchReceiverStreamBuilder::new(
+            Arc::clone(&self.projected_schema),
+            10, // channel buffer
+        );
         let tx = builder.tx();
         let pool = self.db.inner.pool.clone();
-        let schema = self.schema();
         let target = self.db.inner.target.clone();
         let limit = self.limit.clone();
+        let p_sch = Arc::clone(&self.projected_schema);
+
         builder.spawn(async move {
-            let batch = get_opendal_record_batch(target,schema,pool,limit).await?;
-            tx.send(Ok(batch)).await.unwrap();
+            let op = pool
+                .get()
+                .await
+                .map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))?;
+
+            let mut lister = {
+                let mut builder = op.lister_with(&target);
+                if let Some(l) = limit {
+                    builder = builder.limit(l);
+                }
+                builder.await.map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))?
+            };
+
+            // These correspond to columns
+            let mut path_array = Vec::new();
+            let mut name_array = Vec::new();
+            let mut blob_array = Vec::new();
+            let mut file_array = Vec::new();
+            let mut size_array = Vec::new();
+            let mut content_array = Vec::new();
+            let mut last_modified_array = Vec::new();
+
+            let mut accumulated_size = 0u64;
+            let mut row_count = 0usize;
+
+            while let Some(entry) = lister.try_next().await.map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))? {
+                if entry.metadata().mode() == EntryMode::Unknown {
+                    continue;
+                }
+
+                if p_sch.fields.find(NAME_COL).is_some() {
+                    name_array.push(entry.name().to_string());
+                }
+
+                let (path, meta) = entry.into_parts();
+                let is_file = meta.is_file();
+
+                if p_sch.fields.find(PATH_COL).is_some() {
+                    path_array.push(path.clone());
+                }
+                if p_sch.fields.find(IS_FILE_COL).is_some() {
+                    file_array.push(is_file);
+                }
+
+                // collect metadata
+                let meta2 = op.stat(&path).await.map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))?;
+                let sz = meta2.content_length();
+                accumulated_size += sz;
+                if p_sch.fields.find(SIZE_COL).is_some() {
+                    size_array.push(sz);
+                }
+                if p_sch.fields.find(CONTENT_TYPE_COL).is_some() {
+                    content_array.push(meta2.content_type().map(str::to_string));
+                }
+                if p_sch.fields.find(LAST_MODIFIED_COL).is_some() {
+                    last_modified_array.push(meta2.last_modified().and_then(|t| t.timestamp_nanos_opt()));
+                }
+
+                let include_blob = p_sch.fields.find(BLOB_COL).is_some();
+                if include_blob && is_file {
+                    blob_array.push(Some(op.read(&path).await.map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))?.to_vec()));
+                } else {
+                    blob_array.push(None);
+                }
+
+                row_count += 1;
+
+                let should_flush =  if include_blob {
+                    accumulated_size >= BATCH_SIZE_THRESHOLD || row_count >= ROW_COUNT_THRESHOLD
+                } else {
+                    row_count >= ROW_COUNT_THRESHOLD
+                };
+
+                // flush if we exceed threshold
+                if should_flush {
+                    let batch = build_batch(
+                        &p_sch,
+                        &path_array,
+                        &name_array,
+                        &blob_array,
+                        &file_array,
+                        &size_array,
+                        &content_array,
+                        &last_modified_array,
+                    )?;
+
+                    tx.send(Ok(batch)).await.unwrap();
+
+                    // reset buffers
+                    path_array.clear();
+                    name_array.clear();
+                    blob_array.clear();
+                    file_array.clear();
+                    size_array.clear();
+                    content_array.clear();
+                    last_modified_array.clear();
+                    accumulated_size = 0;
+                    row_count = 0;
+                }
+            }
+
+            // send final partial batch if any
+            if !path_array.is_empty() {
+                let batch = build_batch(
+                    &p_sch,
+                    &path_array,
+                    &name_array,
+                    &blob_array,
+                    &file_array,
+                    &size_array,
+                    &content_array,
+                    &last_modified_array,
+                )?;
+                tx.send(Ok(batch)).await.unwrap();
+            }
+
             Ok(())
         });
+
         Ok(builder.build())
     }
 }
 
-async fn get_opendal_record_batch<T>(target: String, schema: SchemaRef, pool: managed::Pool<OpenDALManager<T>>, limit: Option<usize>) -> Result<RecordBatch> 
-where
-    T: Configurator + Clone + Send + Sync + 'static + Debug,
-{
-    let op = pool.get().await.map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))?;
-    RecordBatch::try_new(
-        schema.clone(),
-        file_lister(target, schema, &op, limit).await.map_err(|e| Into::<DataFusionError>::into(e))?,
-    ).map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))
-}
+fn build_batch(
+    schema: &SchemaRef,
+    paths: &[String],
+    names: &[String],
+    blobs: &[Option<Vec<u8>>],
+    is_files: &[bool],
+    sizes: &[u64],
+    content_types: &[Option<String>],
+    last_modified: &[Option<i64>],
+) -> Result<RecordBatch> {
+    let mut columns: Vec<Arc<dyn Array>> = Vec::new();
 
-async fn file_lister(target: String, schema: SchemaRef, op: &Operator, limit: Option<usize>) -> Result<Vec<Arc<dyn Array>>,OpenDALExecError> {
-    let mut rtn = Vec::new();
-    let mut lister = {
-        let mut builder = op.lister_with(&target);
-        if let Some(l) = limit {
-            builder = builder.limit(l);
-        }
-        builder.await?
-    };
-    let mut path_array: Option<Vec<String>> = schema.fields.find("path").map(|_| Vec::new());
-    let mut name_array: Option<Vec<String>> = schema.fields.find("name").map(|_| Vec::new());
-    let mut blob_array: Option<Vec<Option<Vec<u8>>>> = schema.fields.find("blob").map(|_| Vec::new());
-    let mut file_array: Option<Vec<bool>> = schema.fields.find("is_file").map(|_| Vec::new());
-    let mut size_array: Option<Vec<u64>> = schema.fields.find("size").map(|_| Vec::new());
-    let mut content_array: Option<Vec<Option<String>>> = schema.fields.find("content_type").map(|_| Vec::new());
-    let mut last_modified_array: Option<Vec<Option<i64>>> = schema.fields.find("last_modified").map(|_| Vec::new());
+    if schema.fields.find(PATH_COL).is_some() {
+        columns.push(Arc::new(StringArray::from(paths.to_vec())));
+    }
+    if schema.fields.find(NAME_COL).is_some() {
+        columns.push(Arc::new(StringArray::from(names.to_vec())));
+    }
+    if schema.fields.find(BLOB_COL).is_some() {
+        let refs: Vec<Option<&[u8]>> = blobs.iter().map(|b| b.as_deref()).collect();
+        columns.push(Arc::new(LargeBinaryArray::from_opt_vec(refs)));
+    }
+    if schema.fields.find(IS_FILE_COL).is_some() {
+        columns.push(Arc::new(BooleanArray::from(is_files.to_vec())));
+    }
+    if schema.fields.find(SIZE_COL).is_some() {
+        columns.push(Arc::new(UInt64Array::from(sizes.to_vec())));
+    }
+    if schema.fields.find(CONTENT_TYPE_COL).is_some() {
+        columns.push(Arc::new(StringArray::from(content_types.to_vec())));
+    }
+    if schema.fields.find(LAST_MODIFIED_COL).is_some() {
+        columns.push(Arc::new(TimestampNanosecondArray::from(last_modified.to_vec())));
+    }
+    if columns.is_empty() {
+        // DataFusion expects at least one column per batch.
+        let dummy: Vec<bool> = std::iter::repeat(true).take(paths.len().max(1)).collect();
+        columns.push(Arc::new(BooleanArray::from(dummy)) as Arc<dyn Array>);
+    }
 
-    while let Some(entry) = lister.try_next().await? {
-        if entry.metadata().mode() == EntryMode::Unknown {
-            continue
-        }
-        if let Some(ref mut vec) = name_array {
-            vec.push(entry.name().to_string());
-        }
-        let (path, meta) = entry.into_parts();
-        if let Some(ref mut vec) = path_array {
-            vec.push(path.clone());
-        }
-        if let Some(ref mut vec) = blob_array {
-            if !meta.is_file() {
-                vec.push(None);
-            } else {
-                vec.push(Some(op.read(&path).await?.to_vec()));
-            }
-        }
-        if let Some(ref mut vec) = file_array {
-            vec.push(meta.is_file());
-        }
-        if size_array.is_some() || content_array.is_some() || last_modified_array.is_some() {
-            // Looks like these properties aren't loaded unless we call stat
-            let meta2 = op.stat(&path).await?;
-            if let Some(ref mut vec) = size_array {
-                vec.push(meta2.content_length());
-            }
-            if let Some(ref mut vec) = content_array {
-                vec.push(meta2.content_type().map(str::to_string));
-            }
-            if let Some(ref mut vec) = last_modified_array {
-                vec.push(meta2.last_modified().and_then(|t| t.timestamp_nanos_opt()));
-            }
-        }
-    }
-    if let Some(vec) = path_array {
-        rtn.push(Arc::new(StringArray::from(vec)) as Arc<dyn Array>);
-    }
-    if let Some(vec) = name_array {
-        rtn.push(Arc::new(StringArray::from(vec)) as Arc<dyn Array>);
-    }
-    if let Some(vec) = blob_array {
-        let v_refs: Vec<Option<&[u8]>> = vec.iter().map(|b| b.as_deref()).collect();
-        rtn.push(Arc::new(LargeBinaryArray::from_opt_vec(v_refs)) as Arc<dyn Array>);
-    }
-    if let Some(vec) = file_array {
-        rtn.push(Arc::new(BooleanArray::from(vec)) as Arc<dyn Array>);
-    }
-    if let Some(vec) = size_array {
-        rtn.push(Arc::new(UInt64Array::from(vec)) as Arc<dyn Array>);
-    }
-    if let Some(vec) = content_array {
-        rtn.push(Arc::new(StringArray::from(vec)) as Arc<dyn Array>);
-    }
-    if let Some(vec) = last_modified_array {
-        rtn.push(Arc::new(TimestampNanosecondArray::from(vec)) as Arc<dyn Array>);
-    }
-    Ok(rtn)
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
 #[derive(Clone,Debug)]
@@ -389,8 +479,8 @@ where
 
         // Check that schema has what we need in it
         let schema: SchemaRef = data.schema();
-        let path_column_index = schema.index_of("path").map_err(|_| Into::<DataFusionError>::into(OpenDALExecError::InvalidSchema("Insert operations must reference `path` column".to_string())))?;
-        let blob_column_index = schema.index_of("blob").map_err(|_| Into::<DataFusionError>::into(OpenDALExecError::InvalidSchema("Insert operations must reference `blob` column and provide binary data".to_string())))?;
+        let path_column_index = schema.index_of(PATH_COL).map_err(|_| Into::<DataFusionError>::into(OpenDALExecError::InvalidSchema("Insert operations must reference `path` column".to_string())))?;
+        let blob_column_index = schema.index_of(BLOB_COL).map_err(|_| Into::<DataFusionError>::into(OpenDALExecError::InvalidSchema("Insert operations must reference `blob` column and provide binary data".to_string())))?;
 
         if !matches!(schema.field(path_column_index).data_type(), DataType::Utf8) || !matches!(schema.field(blob_column_index).data_type(), DataType::LargeBinary) {
             return Err(Into::<DataFusionError>::into(OpenDALExecError::InvalidSchema("Path must be of type string, and blob must be binary".to_string())));

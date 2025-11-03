@@ -29,7 +29,7 @@ use opendal::services::FsConfig;
 #[tokio::main]
 async fn main() {
     let mut cfg = FsConfig::default();
-    cfg.root = Some("/home/blinn/Downloads/".to_string());
+    cfg.root = Some("/home/blinn/Downloads/test".to_string());
     let table_factory = OpenDALDataSource::new(cfg,"/".to_string()).unwrap();
     //let table_factory = OpenDALDataSource::new(Fs::default().root("/")).unwrap();
 
@@ -46,7 +46,7 @@ async fn main() {
     .expect("failed to register table");
 
     let dfi = ctx
-        .sql("INSERT INTO datafusion.public.root_files (path,blob) VALUES ('hello',CAST('hello' AS BYTEA))")
+        .sql("INSERT OVERWRITE TABLE datafusion.public.root_files (path,blob) VALUES ('hello', CAST('hello' AS BYTEA))")
         .await
         .expect("select failed");
     match dfi.show().await {
@@ -56,7 +56,8 @@ async fn main() {
 
     // Query Example 1: Query the renamed table through default catalog
     let df = ctx
-        .sql("SELECT name, is_file, size, content_type, last_modified AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' FROM datafusion.public.root_files")
+//        .sql("SELECT name, is_file, size, content_type, last_modified AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' FROM datafusion.public.root_files")
+        .sql("SELECT * FROM datafusion.public.root_files ORDER BY last_modified DESC, path DESC")
         .await
         .expect("select failed");
     match df.show().await {
