@@ -8,14 +8,17 @@ use datafusion::physical_plan::{
     PlanProperties
 };
 use futures::TryStreamExt;
+use futures::stream::StreamExt;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::execution_plan::{EmissionType,Boundedness};
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::array::{Array,LargeBinaryArray,StringArray,BooleanArray,UInt64Array,TimestampNanosecondArray};
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::datasource::sink::DataSink;
 use opendal::Operator;
 use opendal::Configurator;
 use opendal::EntryMode;
@@ -27,12 +30,17 @@ use opendal::Error as opendalErr;
 use std::error::Error;
 use std::fmt::Display;
 use std::fmt;
+use async_trait::async_trait;
+use datafusion::physical_plan::metrics::MetricsSet;
+use crate::util::retriable_error::check_and_mark_retriable_error;
 
 #[derive(Debug)]
 pub enum OpenDALExecError {
     OpenDALErr(String),
     PoolErr(String),
     ArrowErr(String),
+    InvalidSchema(String),
+    OverwriteError(String),
 }
 
 impl From<opendalErr> for OpenDALExecError {
@@ -73,6 +81,9 @@ impl Display for OpenDALExecError {
             OpenDALExecError::OpenDALErr(inner) => write!(f, "{}", inner),
             OpenDALExecError::PoolErr(inner) => write!(f, "{}", inner),
             OpenDALExecError::ArrowErr(inner) => write!(f, "{}", inner),
+            OpenDALExecError::InvalidSchema(inner) => write!(f,"{}",inner),
+            OpenDALExecError::OverwriteError(inner) => write!(f,"{}",inner),
+
         }
     }
 }
@@ -107,12 +118,45 @@ where
 
 /// A custom datasource, used to represent a datastore with a single index
 #[derive(Clone, Debug)]
-pub struct OpenDALDataSource<T>
+pub struct OpenDALDataSourceInner<T>
 where
     T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     pool: managed::Pool<OpenDALManager<T>>,
     target: String,
+    pub schema: SchemaRef,
+}
+
+impl<T> OpenDALDataSourceInner<T>
+where
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
+{
+    pub fn new(bldr: T, target: String) -> Result<Self,OpenDALExecError> {
+        let manager = OpenDALManager::new(bldr);
+        let pool = managed::Pool::builder(manager).build()?;
+        let schema = SchemaRef::new(Schema::new(vec![
+            Field::new("path", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("blob", DataType::LargeBinary, true),
+            Field::new("is_file", DataType::Boolean, true),
+            Field::new("size", DataType::UInt64, true),
+            Field::new("content_type", DataType::Utf8, true),
+            Field::new("last_modified", DataType::Timestamp(TimeUnit::Nanosecond,None), true),
+        ]));
+        Ok(Self {
+            pool,
+            target,
+            schema,
+           })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OpenDALDataSource<T> 
+where
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
+{
+    pub inner: Arc<OpenDALDataSourceInner<T>>,
 }
 
 impl<T> OpenDALDataSource<T>
@@ -120,12 +164,9 @@ where
     T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     pub fn new(bldr: T, target: String) -> Result<Self,OpenDALExecError> {
-        let manager = OpenDALManager::new(bldr);
-        let pool = managed::Pool::builder(manager).build()?;
         Ok(Self {
-            pool,
-            target,
-           })
+            inner: Arc::new(OpenDALDataSourceInner::new(bldr, target)?),
+        })
     }
 }
 
@@ -145,10 +186,10 @@ impl<T> OpenDALExec<T>
 where
     T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
-    pub fn build(projections: Option<&Vec<usize>>, schema: SchemaRef, db: OpenDALDataSource<T>, limit: Option<usize>) -> Result<Self,DataFusionError> {
-        let projected_schema = project_schema(&schema, projections)?;
+    pub fn try_new(projections: Option<&Vec<usize>>, db: &OpenDALDataSource<T>, limit: Option<usize>) -> Result<Self,DataFusionError> {
+        let projected_schema = project_schema(&db.inner.schema, projections)?;
         Ok(Self {
-            db,
+            db: db.clone(),
             projected_schema: projected_schema.clone(),
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
@@ -186,7 +227,6 @@ where
         self.projected_schema.clone()
     }
 
-
     fn properties(&self) -> &PlanProperties {
         &self.properties
     }
@@ -209,9 +249,9 @@ where
     ) -> Result<SendableRecordBatchStream> {
         let mut builder = RecordBatchReceiverStreamBuilder::new(Arc::clone(&self.projected_schema), 10);
         let tx = builder.tx();
-        let pool = self.db.pool.clone();
+        let pool = self.db.inner.pool.clone();
         let schema = self.schema();
-        let target = self.db.target.clone();
+        let target = self.db.inner.target.clone();
         let limit = self.limit.clone();
         builder.spawn(async move {
             let batch = get_opendal_record_batch(target,schema,pool,limit).await?;
@@ -242,6 +282,7 @@ async fn file_lister(target: String, schema: SchemaRef, op: &Operator, limit: Op
         }
         builder.await?
     };
+    let mut path_array: Option<Vec<String>> = schema.fields.find("path").map(|_| Vec::new());
     let mut name_array: Option<Vec<String>> = schema.fields.find("name").map(|_| Vec::new());
     let mut blob_array: Option<Vec<Option<Vec<u8>>>> = schema.fields.find("blob").map(|_| Vec::new());
     let mut file_array: Option<Vec<bool>> = schema.fields.find("is_file").map(|_| Vec::new());
@@ -257,6 +298,9 @@ async fn file_lister(target: String, schema: SchemaRef, op: &Operator, limit: Op
             vec.push(entry.name().to_string());
         }
         let (path, meta) = entry.into_parts();
+        if let Some(ref mut vec) = path_array {
+            vec.push(path.clone());
+        }
         if let Some(ref mut vec) = blob_array {
             if !meta.is_file() {
                 vec.push(None);
@@ -281,6 +325,9 @@ async fn file_lister(target: String, schema: SchemaRef, op: &Operator, limit: Op
             }
         }
     }
+    if let Some(vec) = path_array {
+        rtn.push(Arc::new(StringArray::from(vec)) as Arc<dyn Array>);
+    }
     if let Some(vec) = name_array {
         rtn.push(Arc::new(StringArray::from(vec)) as Arc<dyn Array>);
     }
@@ -301,4 +348,103 @@ async fn file_lister(target: String, schema: SchemaRef, op: &Operator, limit: Op
         rtn.push(Arc::new(TimestampNanosecondArray::from(vec)) as Arc<dyn Array>);
     }
     Ok(rtn)
+}
+
+#[derive(Clone,Debug)]
+pub struct OpenDALDataSink<T>
+where
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
+{
+    db: OpenDALDataSource<T>,
+    overwrite: InsertOp,
+}
+
+#[async_trait]
+impl<T> DataSink for OpenDALDataSink<T> 
+where
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
+{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.db.inner.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut data: SendableRecordBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> datafusion::common::Result<u64> {
+        let mut num_files = 0;
+        let op = self.db.inner.pool.get().await.map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))?;
+
+        // Should we replace files if they already exist, or throw error
+        let replace = matches!(self.overwrite, InsertOp::Overwrite | InsertOp::Replace);
+
+        // Check that schema has what we need in it
+        let schema: SchemaRef = data.schema();
+        let path_column_index = schema.index_of("path").map_err(|_| Into::<DataFusionError>::into(OpenDALExecError::InvalidSchema("Insert operations must reference `path` column".to_string())))?;
+        let blob_column_index = schema.index_of("blob").map_err(|_| Into::<DataFusionError>::into(OpenDALExecError::InvalidSchema("Insert operations must reference `blob` column and provide binary data".to_string())))?;
+
+        if !matches!(schema.field(path_column_index).data_type(), DataType::Utf8) || !matches!(schema.field(blob_column_index).data_type(), DataType::LargeBinary) {
+            return Err(Into::<DataFusionError>::into(OpenDALExecError::InvalidSchema("Path must be of type string, and blob must be binary".to_string())));
+        }
+
+        while let Some(batch_result) = data.next().await {
+            let batch = batch_result.map_err(check_and_mark_retriable_error)?;
+
+            let path_col = batch
+                .column(path_column_index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| Into::<DataFusionError>::into(OpenDALExecError::InvalidSchema("`path` must be StringArray".to_string())))?;
+            if let Some(bin_col) = batch.column(blob_column_index).as_any().downcast_ref::<LargeBinaryArray>() {
+                for i in 0..batch.num_rows() {
+                    let p = path_col.value(i);
+                    let blob = bin_col.value(i).to_vec();
+                    write_one(&op,&p, blob, replace).await.map_err(Into::<DataFusionError>::into)?;
+                    num_files += 1;
+                }
+            }
+        }
+        Ok(num_files)
+    }
+}
+
+async fn write_one(op: &Operator, path: &str, data: impl Into<Vec<u8>>, replace: bool) -> Result<(),OpenDALExecError> {
+    if op.exists(path).await? && !replace {
+        return Err(OpenDALExecError::OverwriteError(format!("Path {} exists and overwrite not allowed",path)));
+    }
+    op.write(path, data.into()).await?;
+    Ok(())
+}
+
+impl<T> OpenDALDataSink<T>
+where
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
+{
+    pub fn new(
+        db: &OpenDALDataSource<T>,
+        overwrite: InsertOp,
+    ) -> Self {
+        Self {
+            db: db.clone(),
+            overwrite,
+        }
+    }
+}
+
+impl<T> DisplayAs for OpenDALDataSink<T> 
+where
+    T: Configurator + Clone + Send + Sync + 'static + Debug,
+{
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "OpenDALDataSink")
+    }
 }

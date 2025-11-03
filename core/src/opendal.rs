@@ -1,35 +1,20 @@
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::datasource::{TableProvider, TableType};
+use datafusion::datasource::{TableProvider, TableType, sink::DataSinkExec};
 use datafusion::logical_expr::expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::arrow::datatypes::SchemaRef;
 use std::sync::Arc;
 use std::any::Any;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use datafusion::logical_expr::dml::InsertOp;
 
 use datafusion::error::DataFusionError;
 use opendal::Configurator;
 use std::fmt::Debug;
 
 mod executor;
-use crate::opendal::executor::OpenDALExec;
+use crate::opendal::executor::{OpenDALExec,OpenDALDataSink};
 pub use crate::opendal::executor::OpenDALDataSource;
-
-
-impl<T> OpenDALDataSource<T>
-where
-    T: Configurator + Clone + Send + Sync + 'static + Debug,
-{
-    pub(crate) async fn create_physical_plan(
-        &self,
-        projections: Option<&Vec<usize>>,
-        schema: SchemaRef,
-        _filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>,DataFusionError> {
-        Ok(Arc::new(OpenDALExec::build(projections, schema, self.clone(),limit)?))
-    }
-}
 
 #[async_trait]
 impl<T> TableProvider for OpenDALDataSource<T>
@@ -41,14 +26,7 @@ where
     }
 
     fn schema(&self) -> SchemaRef {
-        SchemaRef::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("blob", DataType::LargeBinary, true),
-            Field::new("is_file", DataType::Boolean, false),
-            Field::new("size", DataType::UInt64, false),
-            Field::new("content_type", DataType::Utf8, true),
-            Field::new("last_modified", DataType::Timestamp(TimeUnit::Nanosecond,None), true),
-        ]))
+        self.inner.schema.clone()
     }
 
     fn table_type(&self) -> TableType {
@@ -60,11 +38,25 @@ where
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         // filters and limit can be used here to inject some push-down operations if needed
-        filters: &[Expr],
+        _filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>,DataFusionError> {
-        return self
-            .create_physical_plan(projection, self.schema(), filters, limit)
-            .await;
+        Ok(Arc::new(OpenDALExec::try_new(projection, self,limit)?))
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        op: InsertOp,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(DataSinkExec::new(
+            input,
+            Arc::new(OpenDALDataSink::new(
+                self,
+                op,
+            )),
+            None,
+        )) as _)
     }
 }

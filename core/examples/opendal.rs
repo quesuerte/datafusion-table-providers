@@ -29,8 +29,8 @@ use opendal::services::FsConfig;
 #[tokio::main]
 async fn main() {
     let mut cfg = FsConfig::default();
-    cfg.root = Some("/".to_string());
-    let table_factory = OpenDALDataSource::new(cfg,"/home/blinn/Downloads/".to_string()).unwrap();
+    cfg.root = Some("/home/blinn/Downloads/".to_string());
+    let table_factory = OpenDALDataSource::new(cfg,"/".to_string()).unwrap();
     //let table_factory = OpenDALDataSource::new(Fs::default().root("/")).unwrap();
 
     // Create DataFusion session context
@@ -44,6 +44,15 @@ async fn main() {
         Arc::new(table_factory)
     )
     .expect("failed to register table");
+
+    let dfi = ctx
+        .sql("INSERT INTO datafusion.public.root_files (path,blob) VALUES ('hello',CAST('hello' AS BYTEA))")
+        .await
+        .expect("select failed");
+    match dfi.show().await {
+        Ok(_val) => (),
+        Err(err) => println!("Failed to insert records: {}",err)
+    };
 
     // Query Example 1: Query the renamed table through default catalog
     let df = ctx
