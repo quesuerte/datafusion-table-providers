@@ -1,6 +1,6 @@
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::opendal::OpenDALDataSource;
-use std::sync::Arc;
+use std::{sync::Arc,time::Instant};
 use opendal::services::FsConfig;
 
 /// This example demonstrates how to:
@@ -29,7 +29,7 @@ use opendal::services::FsConfig;
 #[tokio::main]
 async fn main() {
     let mut cfg = FsConfig::default();
-    cfg.root = Some("/home/blinn/Downloads/test".to_string());
+    cfg.root = Some("/home/blinn/Downloads".to_string());
     let table_factory = OpenDALDataSource::new(cfg,"/".to_string()).unwrap();
     //let table_factory = OpenDALDataSource::new(Fs::default().root("/")).unwrap();
 
@@ -55,11 +55,13 @@ async fn main() {
     };
 
     // Query Example 1: Query the renamed table through default catalog
+    let start = Instant::now();
     let df = ctx
 //        .sql("SELECT name, is_file, size, content_type, last_modified AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' FROM datafusion.public.root_files")
-        .sql("SELECT COUNT(*) FROM datafusion.public.root_files")
+        .sql("SELECT * FROM datafusion.public.root_files WHERE path = '/test'")
         .await
         .expect("select failed");
+    println!("Query executed in: {:?}",start.elapsed());
     match df.show().await {
         Ok(_val) => (),
         Err(err) => println!("Failed to retreive results: {}",err)

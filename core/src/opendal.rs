@@ -1,19 +1,18 @@
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType, sink::DataSinkExec};
-use datafusion::logical_expr::expr::Expr;
+use datafusion::logical_expr::{dml::InsertOp,expr::Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::error::DataFusionError;
 use std::sync::Arc;
 use std::any::Any;
-use datafusion::logical_expr::dml::InsertOp;
 
-use datafusion::error::DataFusionError;
 use opendal::Configurator;
 use std::fmt::Debug;
 
 mod executor;
-use crate::opendal::executor::{OpenDALExec,OpenDALDataSink};
+use crate::opendal::executor::{OpenDALExec,OpenDALDataSink,extract_simple_binary_filters};
 pub use crate::opendal::executor::OpenDALDataSource;
 
 #[async_trait]
@@ -38,10 +37,10 @@ where
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         // filters and limit can be used here to inject some push-down operations if needed
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>,DataFusionError> {
-        Ok(Arc::new(OpenDALExec::try_new(projection, self,limit)?))
+        Ok(Arc::new(OpenDALExec::try_new(projection, self, filters, limit)?))
     }
 
     async fn insert_into(
@@ -58,5 +57,20 @@ where
             )),
             None,
         )) as _)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        let mut rtn = Vec::new();
+        for filter in extract_simple_binary_filters(filters) {
+            if filter.is_some() {
+                rtn.push(TableProviderFilterPushDown::Exact)
+            } else {
+                rtn.push(TableProviderFilterPushDown::Unsupported)
+            }
+        }
+        Ok(rtn)
     }
 }
