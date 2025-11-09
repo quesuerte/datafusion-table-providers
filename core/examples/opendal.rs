@@ -30,7 +30,7 @@ use opendal::services::FsConfig;
 async fn main() {
     let mut cfg = FsConfig::default();
     cfg.root = Some("/home/blinn/Downloads".to_string());
-    let table_factory = OpenDALDataSource::new(cfg,"/".to_string()).unwrap();
+    let table_factory = OpenDALDataSource::new(cfg).unwrap();
     //let table_factory = OpenDALDataSource::new(Fs::default().root("/")).unwrap();
 
     // Create DataFusion session context
@@ -58,7 +58,7 @@ async fn main() {
     let start = Instant::now();
     let df = ctx
 //        .sql("SELECT name, is_file, size, content_type, last_modified AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' FROM datafusion.public.root_files")
-        .sql("SELECT * FROM datafusion.public.root_files WHERE path = '/test'")
+        .sql("SELECT root, parent, path, size FROM datafusion.public.root_files WHERE recursive = true")
         .await
         .expect("select failed");
     println!("Query executed in: {:?}",start.elapsed());

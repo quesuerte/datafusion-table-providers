@@ -31,6 +31,7 @@ const URI_COL: &str = "uri";
 const NAMESPACE_COL: &str = "namespace";
 const ROOT_COL: &str = "root";
 const RECURSIVE_COL: &str = "recursive";
+const PARENT_COL: &str = "parent";
 const PATH_COL: &str = "path";
 const NAME_COL: &str = "name";
 const BLOB_COL: &str = "blob";
@@ -42,6 +43,7 @@ const ORDERED_COLUMNS: &[&str] = &[
     URI_COL,
     NAMESPACE_COL,
     ROOT_COL,
+    PARENT_COL,
     PATH_COL,
     NAME_COL,
     SIZE_COL,
@@ -156,7 +158,6 @@ where
     T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
     pool: managed::Pool<OpenDALManager<T>>,
-    target: String,
     pub schema: SchemaRef,
 }
 
@@ -164,7 +165,7 @@ impl<T> OpenDALDataSourceInner<T>
 where
     T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
-    pub fn new(bldr: T, target: String) -> Result<Self,OpenDALExecError> {
+    pub fn new(bldr: T) -> Result<Self,OpenDALExecError> {
         let manager = OpenDALManager::new(bldr);
         let pool = managed::Pool::builder(manager).build()?;
         let schema = SchemaRef::new(Schema::new(vec![
@@ -172,6 +173,7 @@ where
             Field::new(NAMESPACE_COL, DataType::Utf8, true),
             Field::new(ROOT_COL, DataType::Utf8, true),
             Field::new(RECURSIVE_COL, DataType::Boolean, true),
+            Field::new(PARENT_COL, DataType::Utf8, true),
             Field::new(PATH_COL, DataType::Utf8, false),
             Field::new(NAME_COL, DataType::Utf8, true),
             Field::new(BLOB_COL, DataType::LargeBinary, true),
@@ -182,7 +184,6 @@ where
         ]));
         Ok(Self {
             pool,
-            target,
             schema,
            })
     }
@@ -200,9 +201,9 @@ impl<T> OpenDALDataSource<T>
 where
     T: Configurator + Clone + Send + Sync + 'static + Debug,
 {
-    pub fn new(bldr: T, target: String) -> Result<Self,OpenDALExecError> {
+    pub fn new(bldr: T) -> Result<Self,OpenDALExecError> {
         Ok(Self {
-            inner: Arc::new(OpenDALDataSourceInner::new(bldr, target)?),
+            inner: Arc::new(OpenDALDataSourceInner::new(bldr)?),
         })
     }
 }
@@ -291,7 +292,6 @@ where
         );
         let tx = builder.tx();
         let pool = self.db.inner.pool.clone();
-        let target = self.db.inner.target.clone();
         let limit = self.limit.clone();
         let filter_refs = self.filters.iter().collect::<Vec<&Expr>>();
         // If there is an aggregate or something that doesn't project any columns, project primary
@@ -326,6 +326,7 @@ where
             let namespace: Option<String> = Some(op_info.name()).filter(|s| !s.is_empty());
             let mut recursive: Option<bool> = None;
             let mut input_path: Option<String> = None;
+            let mut input_parent: Option<String> = None;
             if let Some(vec) = conditions.get(URI_COL) {
                 for (op,literal) in vec {
                     // If URI doesn't match, we're in the wrong place
@@ -370,29 +371,65 @@ where
             }
             let rec = recursive.unwrap_or(false);
 
+            // This sets the directory in which we'll start listing
+            if let Some(vec) = conditions.get(PARENT_COL) {
+                for (op,literal) in vec {
+                    // If there are multiple input paths and they don't match, quit
+                    if let Some(p) = input_parent.clone() {
+                        if !eval_simple_expr(p.into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {
+                            return Ok(());
+                        }
+                    // I want to take recursive as an input parameter, take the first provided one
+                    } else {
+                        if let ScalarValue::Utf8(val) = &literal {
+                            input_parent = Some(val.clone().unwrap_or("/".to_string()));
+                        } else {
+                            input_parent = Some("/".to_string());
+                        }
+                    }
+                }
+            }
+
             if let Some(vec) = conditions.get(PATH_COL) {
+                if input_parent.is_some() {
+                    return Err(
+                        Into::<DataFusionError>::into(
+                            OpenDALExecError::InvalidSchema(
+                                "Cannot filter on both `parent` and `path`, choose one"
+                                .to_string()
+                                )
+                            )
+                        );
+                }
                 for (op,literal) in vec {
                     // If there are multiple input paths and they don't match, quit
                     if let Some(p) = input_path.clone() {
                         if !eval_simple_expr(p.into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {
                             return Ok(());
                         }
-                    // I want to take recursive as an input parameter, take the first provided one
                     } else {
-                        let new_path = Path::new(literal.try_as_str().unwrap_or(Some("/")).unwrap_or("/"));
-                        if new_path.is_dir() {
-                            input_path = Some(new_path.to_str().unwrap_or("/").to_string());
+                        if let ScalarValue::Utf8(val) = &literal {
+                            let temp = val.clone().unwrap_or("/".to_string());
+                            input_path = Some(
+                                Path::new(&temp)
+                                .parent()
+                                .unwrap_or(Path::new("/"))
+                                .to_str()
+                                .unwrap_or("/")
+                                .to_string()
+                            );
                         } else {
-                            input_path = Some(new_path.parent().unwrap_or(Path::new("/")).to_str().unwrap_or("/").to_string());
+                            input_path = Some("/".to_string());
                         }
                     }
                 }
             }
 
             let mut lister = {
-                let mut builder = match input_path {
-                    Some(p) => op.lister_with(&p),
-                    None => op.lister_with(&target),
+                let mut builder = match (input_parent,input_path) {
+                    (Some(p),None) => op.lister_with(&format!("{}/",&p)),
+                    (None,Some(p)) => op.lister_with(&format!("{}/",&p)),
+                    _ => op.lister_with("/"),
                 };
                 if let Some(r) = recursive {
                     builder = builder.recursive(r);
@@ -405,6 +442,7 @@ where
 
             // These correspond to columns
             let mut path_array = Vec::new();
+            let mut parent_array = Vec::new();
             let mut root_array = Vec::new();
             let mut namespace_array = Vec::new();
             let mut uri_array = Vec::new();
@@ -433,8 +471,17 @@ where
                 let sz = meta2.content_length();
                 let con_type = meta2.content_type().map(str::to_string);
                 let last_mod = meta2.last_modified().and_then(|t| t.timestamp_nanos_opt());
+                let mut parent = Path::new(&path).parent().unwrap_or(Path::new("/")).to_str().unwrap_or("/").to_string();
+                if parent != "/" {
+                    parent.insert_str(0,"/");
+                }
 
                 // Filters
+                if let Some(vec) = conditions.get(PATH_COL) {
+                    for (op,literal) in vec {
+                        if !eval_simple_expr(path.clone().into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue;}
+                    }
+                }
                 if let Some(vec) = conditions.get(NAME_COL) {
                     for (op,literal) in vec {
                         if !eval_simple_expr(name.clone().into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue;}
@@ -473,6 +520,9 @@ where
                 }
                 if p_sch.fields.find(RECURSIVE_COL).is_some() {
                     recursive_array.push(rec);
+                }
+                if p_sch.fields.find(PARENT_COL).is_some() {
+                    parent_array.push(parent);
                 }
                 if p_sch.fields.find(NAME_COL).is_some() {
                     name_array.push(name);
@@ -516,6 +566,7 @@ where
                         &namespace_array,
                         &root_array,
                         &recursive_array,
+                        &parent_array,
                         &path_array,
                         &name_array,
                         &blob_array,
@@ -532,6 +583,7 @@ where
                     namespace_array.clear();
                     root_array.clear();
                     recursive_array.clear();
+                    parent_array.clear();
                     path_array.clear();
                     name_array.clear();
                     blob_array.clear();
@@ -552,6 +604,7 @@ where
                     &namespace_array,
                     &root_array,
                     &recursive_array,
+                    &parent_array,
                     &path_array,
                     &name_array,
                     &blob_array,
@@ -576,6 +629,7 @@ fn build_batch(
     namespaces: &[Option<String>],
     roots: &[String],
     recursives: &[bool],
+    parents: &[String],
     paths: &[String],
     names: &[String],
     blobs: &[Option<Vec<u8>>],
@@ -596,6 +650,9 @@ fn build_batch(
     }
     if schema.fields.find(RECURSIVE_COL).is_some() {
         columns.push(Arc::new(BooleanArray::from(recursives.to_vec())));
+    }
+    if schema.fields.find(PARENT_COL).is_some() {
+        columns.push(Arc::new(StringArray::from(parents.to_vec())));
     }
     if schema.fields.find(PATH_COL).is_some() {
         columns.push(Arc::new(StringArray::from(paths.to_vec())));
@@ -725,29 +782,44 @@ where
 pub fn extract_simple_binary_filters(exprs: &[&Expr]) -> Vec<Option<(String, ExprOp, ScalarValue)>> {
     exprs.iter().map(|expr| {
         // Only handle BinaryExpr nodes
-        if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr {
-            match (&**left, &**right, matches!(&**left, Expr::Column(_))) {
-                (Expr::Column(col), Expr::Literal(value,_),val) |
-                (Expr::Literal(value,_), Expr::Column(col),val) => {
-                    if (ORDERED_COLUMNS.contains(&col.name()) 
-                            && matches!(op, ExprOp::Eq |ExprOp::NotEq |ExprOp::Lt |ExprOp::LtEq |ExprOp::Gt |ExprOp::GtEq)) 
-                        || (BOOLEAN_COLUMNS.contains(&col.name())
-                            && matches!(op, ExprOp::Eq | ExprOp::NotEq)) {
-                        if val {
-                            Some((col.name.clone(), op.clone(), value.clone()))
-                        } else if let Some(swap_op) = op.swap() {
-                            Some((col.name.clone(), swap_op, value.clone()))
+        match expr { 
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                match (&**left, &**right, matches!(&**left, Expr::Column(_))) {
+                    (Expr::Column(col), Expr::Literal(value,_),val) |
+                    (Expr::Literal(value,_), Expr::Column(col),val) => {
+                        if ORDERED_COLUMNS.contains(&col.name()) 
+                                && matches!(op, ExprOp::Eq |ExprOp::NotEq |ExprOp::Lt |ExprOp::LtEq |ExprOp::Gt |ExprOp::GtEq) { 
+                            if val {
+                                Some((col.name.clone(), op.clone(), value.clone()))
+                            } else {
+                                Some((col.name.clone(), op.swap()?, value.clone()))
+                            }
                         } else {
                             None
                         }
+                    },
+                    _ => None, // anything else is too complex
+                }
+            },
+            Expr::Column(col) => {
+                if BOOLEAN_COLUMNS.contains(&col.name()) {
+                    Some((col.name.clone(), ExprOp::Eq, ScalarValue::Boolean(Some(true))))
+                } else {
+                    None
+                }
+            },
+            Expr::Not(expr) => {
+                if let Expr::Column(col) = &**expr {
+                    if BOOLEAN_COLUMNS.contains(&col.name()) {
+                        Some((col.name.clone(), ExprOp::Eq, ScalarValue::Boolean(Some(false))))
                     } else {
                         None
                     }
+                } else {
+                    None
                 }
-                _ => None, // anything else is too complex
-            }
-        } else {
-            None
+            },
+            _ => None,
         }
     }).collect()
 }
