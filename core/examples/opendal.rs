@@ -58,7 +58,7 @@ async fn main() {
     let start = Instant::now();
     let df = ctx
 //        .sql("SELECT name, is_file, size, content_type, last_modified AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' FROM datafusion.public.root_files")
-        .sql("SELECT root, parent, path, size FROM datafusion.public.root_files WHERE recursive = true")
+        .sql("SELECT root, parent, path, size FROM datafusion.public.root_files WHERE recursive = true AND size < 10")
         .await
         .expect("select failed");
     println!("Query executed in: {:?}",start.elapsed());

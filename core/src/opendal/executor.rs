@@ -458,7 +458,7 @@ where
             let mut row_count = 0usize;
             let include_blob = p_sch.fields.find(BLOB_COL).is_some();
 
-            while let Some(entry) = lister.try_next().await.map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))? {
+            'batch: while let Some(entry) = lister.try_next().await.map_err(|e| Into::<DataFusionError>::into(OpenDALExecError::from(e)))? {
                 // If it's not something we know about, don't process it
                 if entry.metadata().mode() == EntryMode::Unknown {
                     continue;
@@ -479,32 +479,32 @@ where
                 // Filters
                 if let Some(vec) = conditions.get(PATH_COL) {
                     for (op,literal) in vec {
-                        if !eval_simple_expr(path.clone().into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue;}
+                        if !eval_simple_expr(path.clone().into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue 'batch;}
                     }
                 }
                 if let Some(vec) = conditions.get(NAME_COL) {
                     for (op,literal) in vec {
-                        if !eval_simple_expr(name.clone().into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue;}
+                        if !eval_simple_expr(name.clone().into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue 'batch;}
                     }
                 }
                 if let Some(vec) = conditions.get(IS_FILE_COL) {
                     for (op,literal) in vec {
-                        if !eval_simple_expr(is_file.into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue;}
+                        if !eval_simple_expr(is_file.into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue 'batch;}
                     }
                 }
                 if let Some(vec) = conditions.get(SIZE_COL) {
                     for (op,literal) in vec {
-                        if !eval_simple_expr(sz.into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue;}
+                        if !eval_simple_expr(sz.into(),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue 'batch;}
                     }
                 }
                 if let Some(vec) = conditions.get(CONTENT_TYPE_COL) {
                     for (op,literal) in vec {
-                        if !eval_simple_expr(ScalarValue::Utf8(con_type.clone()),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue;}
+                        if !eval_simple_expr(ScalarValue::Utf8(con_type.clone()),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue 'batch;}
                     }
                 }
                 if let Some(vec) = conditions.get(LAST_MODIFIED_COL) {
                     for (op,literal) in vec {
-                        if !eval_simple_expr(ScalarValue::TimestampNanosecond(last_mod.clone(),None),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue;}
+                        if !eval_simple_expr(ScalarValue::TimestampNanosecond(last_mod.clone(),None),*op,literal.clone()).map_err(Into::<DataFusionError>::into)? {continue 'batch;}
                     }
                 }
 
