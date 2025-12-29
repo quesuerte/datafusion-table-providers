@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -41,9 +41,10 @@ jobs:
           - 'sqlite'
           - 'mysql'
           - 'flight'
+          - 'adbc'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -67,7 +68,7 @@ jobs:
       MYSQL_DOCKER_IMAGE: public.ecr.aws/ubuntu/mysql:8.0-22.04_beta
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -113,6 +114,12 @@ jobs:
           sudo apt-get install -y unixodbc-dev
           sudo apt-get install -y libsqlite3-dev
 
+      - name: Install ADBC drivers
+        run: |
+          curl -LsSf https://dbc.columnar.tech/install.sh | sh
+          dbc install sqlite
+          dbc install duckdb
+
       - name: Run tests
         run: make test
 
@@ -121,7 +128,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 

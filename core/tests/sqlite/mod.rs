@@ -52,12 +52,10 @@ async fn arrow_sqlite_round_trip(
     // Create sqlite table from arrow records and insert arrow records
     let schema = Arc::clone(&arrow_record.schema());
     let create_table_stmts = CreateTableBuilder::new(schema, table_name).build_sqlite();
-    let insert_table_stmt = InsertBuilder::new(
-        &TableReference::from(table_name),
-        vec![arrow_record.clone()],
-    )
-    .build_sqlite(None)
-    .expect("SQLite insert statement should be constructed");
+    let batches = vec![arrow_record.clone()];
+    let insert_table_stmt = InsertBuilder::new(&TableReference::from(table_name), &batches)
+        .build_sqlite(None)
+        .expect("SQLite insert statement should be constructed");
 
     // Test arrow -> Sqlite row coverage
     let _ = conn
@@ -211,9 +209,18 @@ fn create_comprehensive_test_data() -> (RecordBatch, SchemaRef) {
         None,
         Some(500000u64),
     ]);
-    let col_float32 = Float32Array::from(vec![Some(1.5), None, Some(-3.14), Some(2.71)]);
-    let col_float64 =
-        Float64Array::from(vec![None, Some(2.718281828), Some(-1.414), Some(3.14159)]);
+    let col_float32 = Float32Array::from(vec![
+        Some(1.5),
+        None,
+        Some(-std::f32::consts::PI),
+        Some(2.71),
+    ]);
+    let col_float64 = Float64Array::from(vec![
+        None,
+        Some(std::f64::consts::E),
+        Some(-1.414),
+        Some(std::f64::consts::PI),
+    ]);
     let col_utf8 = StringArray::from(vec![Some("hello"), Some("world"), None, Some("test")]);
     let col_large_utf8 = LargeStringArray::from(vec![
         None,
@@ -301,6 +308,7 @@ async fn test_sqlite_table_provider_roundtrip(
         constraints: Constraints::new_unverified(vec![]),
         column_defaults: HashMap::default(),
         temporary: false,
+        or_replace: false,
     };
 
     let factory = SqliteTableProviderFactory::default()
@@ -347,10 +355,12 @@ async fn test_sqlite_table_provider_roundtrip(
     );
 
     // Cast the result back to the original schema for comparison
+    #[cfg(feature = "sqlite-federation")]
     let casted_result = try_cast_to(result_batch.clone(), Arc::clone(&schema))
         .expect("should cast result to original schema");
 
     // Verify the data matches
+    #[cfg(feature = "sqlite-federation")]
     assert_eq!(
         casted_result, record_batch,
         "Round-tripped data should match original"

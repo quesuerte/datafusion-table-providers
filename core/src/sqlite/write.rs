@@ -221,9 +221,7 @@ impl DataSink for SqliteDataSink {
                 }
 
                 if on_commit_transaction.try_recv().is_err() {
-                    return Err(tokio_rusqlite::Error::Other(
-                        "No message to commit transaction has been received.".into(),
-                    ));
+                    return Err(rusqlite::Error::InvalidQuery);
                 }
 
                 transaction.commit()?;
@@ -234,14 +232,13 @@ impl DataSink for SqliteDataSink {
             .context(super::UnableToInsertIntoTableAsyncSnafu)
             .map_err(|e| {
                 if let super::Error::UnableToInsertIntoTableAsync {
-                    source:
-                        tokio_rusqlite::Error::Rusqlite(rusqlite::Error::SqliteFailure(
-                            rusqlite::ffi::Error {
-                                code: rusqlite::ffi::ErrorCode::DiskFull,
-                                ..
-                            },
-                            _,
-                        )),
+                    source: tokio_rusqlite::Error::Error(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error {
+                            code: rusqlite::ffi::ErrorCode::DiskFull,
+                            ..
+                        },
+                        _,
+                    )),
                 } = e
                 {
                     DataFusionError::External(super::Error::DiskFull {}.into())
@@ -327,6 +324,7 @@ mod tests {
             constraints: Constraints::default(),
             column_defaults: HashMap::default(),
             temporary: false,
+            or_replace: false,
         };
         let ctx = SessionContext::new();
         let table = SqliteTableProviderFactory::default()
@@ -469,6 +467,7 @@ mod tests {
             constraints: Constraints::default(),
             column_defaults: HashMap::default(),
             temporary: false,
+            or_replace: false,
         };
 
         let ctx = SessionContext::new();
@@ -775,6 +774,7 @@ mod tests {
             constraints: Constraints::default(),
             column_defaults: HashMap::default(),
             temporary: false,
+            or_replace: false,
         };
         let ctx = SessionContext::new();
         let table = SqliteTableProviderFactory::default()
@@ -819,6 +819,7 @@ mod tests {
             constraints: Constraints::default(),
             column_defaults: HashMap::default(),
             temporary: false,
+            or_replace: false,
         };
 
         let ctx = SessionContext::new();
