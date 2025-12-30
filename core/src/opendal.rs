@@ -14,6 +14,7 @@ use std::fmt::Debug;
 mod executor;
 use crate::opendal::executor::{OpenDALExec,OpenDALDataSink,extract_simple_binary_filters};
 pub use crate::opendal::executor::OpenDALDataSource;
+pub use opendal::services;
 
 #[async_trait]
 impl<T> TableProvider for OpenDALDataSource<T>
