@@ -382,9 +382,9 @@ where
                     // I want to take recursive as an input parameter, take the first provided one
                     } else {
                         if let ScalarValue::Utf8(val) = &literal {
-                            input_parent = Some(val.clone().unwrap_or("/".to_string()));
+                            input_parent = Some(val.clone().unwrap_or("".to_string()));
                         } else {
-                            input_parent = Some("/".to_string());
+                            input_parent = Some("".to_string());
                         }
                     }
                 }
@@ -409,17 +409,17 @@ where
                         }
                     } else {
                         if let ScalarValue::Utf8(val) = &literal {
-                            let temp = val.clone().unwrap_or("/".to_string());
+                            let temp = val.clone().unwrap_or("".to_string());
                             input_path = Some(
                                 Path::new(&temp)
                                 .parent()
-                                .unwrap_or(Path::new("/"))
+                                .unwrap_or(Path::new(""))
                                 .to_str()
-                                .unwrap_or("/")
+                                .unwrap_or("")
                                 .to_string()
                             );
                         } else {
-                            input_path = Some("/".to_string());
+                            input_path = Some("".to_string());
                         }
                     }
                 }
@@ -429,7 +429,7 @@ where
                 let mut builder = match (input_parent,input_path) {
                     (Some(p),None) => op.lister_with(&format!("{}/",&p)),
                     (None,Some(p)) => op.lister_with(&format!("{}/",&p)),
-                    _ => op.lister_with("/"),
+                    _ => op.lister_with(""),
                 };
                 if let Some(r) = recursive {
                     builder = builder.recursive(r);
