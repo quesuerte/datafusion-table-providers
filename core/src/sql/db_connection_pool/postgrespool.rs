@@ -306,10 +306,11 @@ async fn test_postgres_connection(
 async fn verify_postgres_config(config: &Config) -> Result<()> {
     for host in config.get_hosts() {
         for port in config.get_ports() {
-            let Host::Tcp(host) = host;
-            verify_ns_lookup_and_tcp_connect(host, *port)
-                .await
-                .context(InvalidHostOrPortSnafu { host, port: *port })?;
+            if let Host::Tcp(host) = host {
+                verify_ns_lookup_and_tcp_connect(host, *port)
+                    .await
+                    .context(InvalidHostOrPortSnafu { host, port: *port })?;
+            }
         }
     }
 
